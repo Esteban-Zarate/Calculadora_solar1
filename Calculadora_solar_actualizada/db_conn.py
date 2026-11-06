@@ -1,0 +1,951 @@
+# ══════════════════════════════════════════════════════════════════════════
+# db_conn.py — CAPA DE COMPATIBILIDAD sqlite3 → Turso (libSQL)
+# ------------------------------------------------------------------------
+# Streamlit Community Cloud NO ofrece disco persistente: cualquier archivo
+# escrito en tiempo de ejecución (incluyendo un .db de sqlite3 local) se
+# pierde cada vez que el contenedor se reinicia (inactividad, redeploy,
+# límites de recursos). Turso es un servicio de base de datos compatible
+# con SQLite (mismo motor, mismo SQL) pero con almacenamiento persistente
+# real en la nube, accesible por red.
+#
+# Este módulo imita la API de sqlite3.Connection / sqlite3.Cursor para que
+# el resto del código de la app casi no tenga que cambiar: donde antes había
+#       import sqlite3
+#       conn = sqlite3.connect(DB_PATH)
+# ahora hay
+#       import db_conn
+#       conn = db_conn.connect()
+# y todo lo demás sigue funcionando igual, incluyendo:
+#   - cursor(), execute(sql, params), fetchone()/fetchall()/fetchmany()
+#   - commit(), close(), rollback() (no-ops: ver notas abajo)
+#   - executemany() — tanto en Connection como en Cursor
+#   - conn.row_factory = sqlite3.Row  →  filas accesibles por índice O por
+#     nombre de columna (fila[0] y fila["columna"]), igual que sqlite3.Row
+#   - cursor.description  →  compatible con pandas.read_sql(sql, conn)
+#   - excepciones: los errores de integridad (UNIQUE, etc.) se relanzan
+#     como sqlite3.IntegrityError, y el resto como sqlite3.OperationalError,
+#     para que el código existente que hace
+#         except sqlite3.IntegrityError: ...
+#     siga funcionando SIN modificarse.
+#   - Binary(x) — equivalente a sqlite3.Binary(x) para columnas BLOB
+#
+# CONFIGURACIÓN NECESARIA (una sola vez):
+#   1) Crea una base de datos gratuita en https://turso.tech (o con su CLI).
+#   2) Obtén la URL y el auth token. Usa la URL con esquema "https://"
+#      (si Turso te la da como "libsql://...", este módulo la normaliza
+#      solo — ver _normalizar_url_turso).
+#   3) En Streamlit Community Cloud: panel de tu app → Settings → Secrets,
+#      agrega:
+#           TURSO_DATABASE_URL = "https://tu-base-xxxx.turso.io"
+#           TURSO_AUTH_TOKEN   = "tu-token-aqui"
+#      (En local, puedes usar variables de entorno con los mismos nombres,
+#      o un archivo .streamlit/secrets.toml con esas mismas claves.)
+#
+# NO depende del paquete `libsql-client`: habla directamente el protocolo
+# HTTP de Turso (Hrana v2, endpoint /v2/pipeline) con la librería estándar
+# de Python. Esto se decidió después de que `libsql-client` fallara de dos
+# formas distintas y opacas contra el servidor real (handshake de WebSocket,
+# y luego un HTTP 400 sin mostrar el cuerpo de la respuesta). Este cliente
+# propio SIEMPRE muestra el cuerpo exacto de la respuesta del servidor
+# cuando algo falla.
+#
+# LIMITACIÓN CONOCIDA: la clasificación de errores en IntegrityError vs.
+# OperationalError se hace revisando si la palabra "constraint" aparece en
+# el código/mensaje de error que devuelve Turso (ver _traducir_error). Esto
+# coincide con el formato estándar de SQLite ("UNIQUE constraint failed: ...",
+# "SQLITE_CONSTRAINT..."), pero no se pudo verificar contra un servidor Turso
+# real desde este entorno de desarrollo — si algún `except sqlite3.IntegrityError`
+# no llegara a dispararse en producción, avisa para ajustar la heurística.
+# ══════════════════════════════════════════════════════════════════════════
+
+import base64
+import http.client
+import json
+import os
+import queue
+import re
+import socket
+import time
+from collections import OrderedDict
+import sqlite3  # SOLO para reutilizar sus clases de excepción y sqlite3.Row;
+                 # ya no se usa sqlite3.connect() en ningún lado de este módulo.
+import threading
+import urllib.parse
+
+try:
+    import streamlit as st
+except ImportError:  # por si algún script usa este módulo fuera de Streamlit
+    st = None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CLIENTE HTTP PROPIO PARA TURSO (protocolo Hrana v2 sobre HTTP)
+# ------------------------------------------------------------------------
+# Se usó primero el paquete oficial `libsql-client`, pero dio DOS fallos
+# distintos y opacos contra el servidor real de Turso:
+#   1) WSServerHandshakeError (400) al usar el transporte WebSocket.
+#   2) LibsqlError: "SERVER_ERROR: Server returned HTTP status 400" al usar
+#      el transporte HTTP — sin mostrar el cuerpo real de la respuesta del
+#      servidor, que es justo donde está la pista de qué falla.
+#
+# Este cliente propio habla directamente el protocolo documentado por Turso
+# (Hrana v2, endpoint POST {url}/v2/pipeline) usando solo la librería
+# estándar de Python (urllib + json + base64) — sin depender de terceros, y
+# SIEMPRE mostrando el cuerpo exacto de la respuesta cuando algo falla.
+# Referencia del protocolo: https://github.com/tursodatabase/libsql/blob/main/docs/HRANA_3_SPEC.md
+# ══════════════════════════════════════════════════════════════════════════
+
+class LibsqlError(RuntimeError):
+    """Error del servidor Turso/Hrana. Tiene los mismos atributos (code,
+    explanation) que libsql_client.LibsqlError, para no romper nada que ya
+    dependa de ese nombre/forma."""
+    def __init__(self, message: str, code: str = "UNKNOWN"):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.explanation = message
+
+
+def _valor_a_hrana(v):
+    """Convierte un valor Python al formato de valor Hrana (para enviar)."""
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):           # bool es subclase de int: revisar ANTES que int
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    if isinstance(v, (bytes, bytearray)):
+        return {"type": "blob", "base64": base64.b64encode(bytes(v)).decode("ascii")}
+    return {"type": "text", "value": str(v)}
+
+
+def _valor_de_hrana(d):
+    """Convierte un valor Hrana (recibido) a un valor Python nativo."""
+    tipo = d.get("type")
+    if tipo == "null":
+        return None
+    if tipo == "integer":
+        return int(d["value"])
+    if tipo == "float":
+        return float(d["value"])
+    if tipo == "text":
+        return d["value"]
+    if tipo == "blob":
+        # Turso envía los BLOB en base64 SIN el relleno final "=" (según la
+        # especificación Hrana el relleno es opcional), pero b64decode lo
+        # exige y falla con binascii.Error ("Incorrect padding") según el
+        # tamaño de la imagen. Se completa el relleno antes de decodificar.
+        b64 = d["base64"]
+        b64 += "=" * (-len(b64) % 4)
+        return base64.b64decode(b64)
+    return d.get("value")
+
+
+class _HranaResultSet:
+    """Misma forma que libsql_client.ResultSet: .rows, .columns,
+    .rows_affected, .last_insert_rowid — para no tener que cambiar nada
+    en _Cursor más abajo."""
+    def __init__(self, columns, rows, rows_affected, last_insert_rowid):
+        self.columns = columns
+        self.rows = rows
+        self.rows_affected = rows_affected
+        self.last_insert_rowid = last_insert_rowid
+
+
+class ClienteTursoHTTP:
+    """
+    Cliente HTTP mínimo y transparente para Turso/Hrana v2. Implementa
+    execute(sql, args), batch(stmts) y close() — la misma interfaz que
+    usaba libsql_client.ClientSync, así que _Cursor/Connection más abajo
+    no necesitan cambiar.
+
+    Mantiene un GRUPO (pool) de conexiones TCP/TLS abiertas y las reutiliza
+    entre llamadas (keep-alive), en vez de abrir una nueva por consulta.
+
+    Historial de diseño (para no repetir errores):
+      1. UNA conexión compartida con un candado global: una consulta lenta
+         (o un reintento) bloqueaba a TODAS las sesiones.
+      2. Una conexión POR HILO (threading.local): sin bloqueos, pero Streamlit
+         crea un hilo NUEVO para cada interacción del usuario (el hilo termina
+         cuando no quedan reruns pendientes), así que esa conexión casi nunca
+         se reutilizaba: cada interacción pagaba otro apretón de manos TCP+TLS
+         (contra una base en otra región, cientos de milisegundos).
+      3. (actual) Un pool compartido: cada petición toma EN EXCLUSIVA una
+         conexión libre (o abre una nueva si no hay) y la devuelve al terminar.
+         No hay candado durante la petición, así que ninguna sesión bloquea a
+         otra, y las conexiones sobreviven entre interacciones.
+    """
+    def __init__(self, url: str, auth_token: str, timeout: float = 15.0):
+        partes = urllib.parse.urlsplit(url)
+        self._scheme = partes.scheme
+        self._host = partes.hostname
+        self._port = partes.port or (443 if self._scheme == "https" else 80)
+        self._path = (partes.path.rstrip("/") if partes.path else "") + "/v2/pipeline"
+        self._token = auth_token
+        self._timeout = timeout
+        self.closed = False
+        self._libres = queue.LifoQueue()   # (conexión, instante del último uso)
+        self._max_libres = 8               # conexiones inactivas que se conservan
+        self._max_inactividad = 120.0      # s; el servidor cierra sockets inactivos
+
+    def _abrir_conexion_http(self):
+        cls = http.client.HTTPSConnection if self._scheme == "https" else http.client.HTTPConnection
+        return cls(self._host, self._port, timeout=self._timeout)
+
+    @staticmethod
+    def _cerrar_conexion(conn_http):
+        try:
+            conn_http.close()
+        except Exception:
+            pass
+
+    def _tomar_conexion(self):
+        """(conexión, reutilizada). Toma una libre y reciente, o abre una nueva."""
+        while True:
+            try:
+                conn_http, ultimo_uso = self._libres.get_nowait()
+            except queue.Empty:
+                return self._abrir_conexion_http(), False
+            if time.monotonic() - ultimo_uso > self._max_inactividad:
+                self._cerrar_conexion(conn_http)   # probablemente ya la cerró el servidor
+                continue
+            return conn_http, True
+
+    def _devolver_conexion(self, conn_http):
+        if self.closed or self._libres.qsize() >= self._max_libres:
+            self._cerrar_conexion(conn_http)
+        else:
+            self._libres.put((conn_http, time.monotonic()))
+
+    def _post(self, requests_hrana: list) -> dict:
+        body = json.dumps({"baton": None, "requests": requests_hrana}).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._token}",
+        }
+
+        for intento in (1, 2):
+            conn_http, reutilizada = self._tomar_conexion()
+            fase = "conexión"
+            try:
+                if conn_http.sock is None:
+                    conn_http.connect()
+                fase = "petición"
+                conn_http.request("POST", self._path, body=body, headers=headers)
+                resp = conn_http.getresponse()
+                crudo = resp.read().decode("utf-8", errors="replace")
+                estado = resp.status
+                conservar = not resp.will_close
+            except (http.client.HTTPException, OSError) as e:
+                self._cerrar_conexion(conn_http)
+                # Reintento (una sola vez) SOLO si es seguro: si falló al
+                # CONECTAR (no se envió nada) o si la conexión era una
+                # reutilizada que el servidor cerró por inactividad. Nunca
+                # tras un timeout: ahí el servidor pudo haber procesado ya la
+                # petición y reintentar duplicaría una escritura.
+                es_timeout = isinstance(e, (TimeoutError, socket.timeout))
+                if intento == 1 and not es_timeout and (fase == "conexión" or reutilizada):
+                    continue
+                raise LibsqlError(
+                    f"No se pudo conectar a {self._host}:{self._port}{self._path} "
+                    f"({fase}): {type(e).__name__}: {e}", "CONNECTION_ERROR") from e
+            if conservar:
+                self._devolver_conexion(conn_http)
+            else:
+                self._cerrar_conexion(conn_http)
+            break
+
+        if estado != 200:
+            raise LibsqlError(
+                f"El servidor Turso respondió HTTP {estado} en {self._path}. "
+                f"Cuerpo de la respuesta: {crudo[:1000]}", f"HTTP_{estado}")
+
+        try:
+            data = json.loads(crudo)
+        except json.JSONDecodeError as e:
+            raise LibsqlError(
+                f"Respuesta de Turso no es JSON válido. Cuerpo crudo: {crudo[:1000]}",
+                "INVALID_RESPONSE",
+            ) from e
+        return data
+
+    def execute(self, sql, args=None) -> _HranaResultSet:
+        return self.batch([(sql, args)])[0]
+
+    def batch(self, stmts: list) -> list:
+        """stmts: lista de (sql, args) o (sql,). Devuelve una lista de
+        _HranaResultSet, una por statement (en el mismo orden)."""
+        requests_hrana = []
+        for item in stmts:
+            sql, args = item if isinstance(item, tuple) else (item, None)
+            stmt = {"sql": sql, "want_rows": True}
+            if args:
+                stmt["args"] = [_valor_a_hrana(v) for v in args]
+            requests_hrana.append({"type": "execute", "stmt": stmt})
+        requests_hrana.append({"type": "close"})
+
+        data = self._post(requests_hrana)
+        resultados_crudos = data.get("results", [])
+
+        resultados = []
+        for i, item in enumerate(stmts):
+            if i >= len(resultados_crudos):
+                raise LibsqlError(
+                    f"Turso devolvió menos resultados ({len(resultados_crudos)}) de los "
+                    f"statements enviados ({len(stmts)}). Respuesta completa: "
+                    f"{json.dumps(data)[:1000]}", "RESULT_MISMATCH")
+            r = resultados_crudos[i]
+            if r.get("type") == "error":
+                err = r.get("error", {})
+                raise LibsqlError(err.get("message", str(err)), err.get("code", "SERVER_ERROR"))
+            if r.get("type") != "ok":
+                raise LibsqlError(f"Respuesta inesperada de Turso: {json.dumps(r)[:500]}",
+                                   "UNEXPECTED_RESPONSE")
+
+            resultado = r["response"]["result"]
+            columnas = tuple(c.get("name") for c in resultado.get("cols", []))
+            filas = [tuple(_valor_de_hrana(v) for v in fila) for fila in resultado.get("rows", [])]
+            lastrowid_raw = resultado.get("last_insert_rowid")
+            resultados.append(_HranaResultSet(
+                columns=columnas,
+                rows=filas,
+                rows_affected=resultado.get("affected_row_count", 0),
+                last_insert_rowid=int(lastrowid_raw) if lastrowid_raw is not None else None,
+            ))
+        return resultados
+
+    def close(self):
+        """Cierra todas las conexiones libres del pool (las que estén en uso
+        se cierran al terminar su petición, porque self.closed ya es True)."""
+        self.closed = True
+        while True:
+            try:
+                conn_http, _ = self._libres.get_nowait()
+            except queue.Empty:
+                break
+            self._cerrar_conexion(conn_http)
+
+
+# ─── Resolución de credenciales (env var o st.secrets) ──────────────────────
+_ULTIMO_ERROR_SECRETS = {}  # nombre_credencial -> motivo por el que no se encontró
+
+
+def _leer_credencial(nombre: str):
+    """
+    Lee una credencial de entorno o st.secrets, siempre con .strip(): un
+    espacio o salto de línea pegado por accidente al copiar un token hace
+    que el servidor lo rechace con un error de JWT poco claro ("JWT error:
+    InvalidToken"), así que se quita aquí para no tener que depurarlo cada
+    vez.
+
+    También tolera un error de formato común en secrets.toml: escribir
+        [NOMBRE]
+        NOMBRE = "valor"
+    (una SECCIÓN con el mismo nombre) en vez de simplemente
+        NOMBRE = "valor"
+    En TOML eso crea una tabla anidada, así que st.secrets.get(nombre)
+    devuelve un objeto tipo diccionario en vez del texto esperado — y
+    convertirlo a texto con str(...) produce algo como "{'NOMBRE': '...'}",
+    que ya no es ni una URL ni un token válidos. Aquí se detecta ese caso
+    y se recupera igual el valor de adentro, para que la app funcione
+    aunque el secrets.toml esté mal formateado — pero lo correcto es
+    corregirlo (quitar la línea "[NOMBRE]", dejar solo NOMBRE = "valor").
+    """
+    valor = os.environ.get(nombre)
+    if valor and valor.strip():
+        return valor.strip()
+    if st is None:
+        return None
+    try:
+        valor = st.secrets.get(nombre)
+    except Exception as e:
+        # No se pudo ni siquiera acceder a st.secrets (p. ej. no existe
+        # ningún secrets.toml, o esta versión de Streamlit no permite leerlo
+        # fuera de `streamlit run`). Antes esto se tragaba en silencio y
+        # devolvía None sin explicación — ver diagnosticar_credencial() más
+        # abajo si necesitas ver el motivo exacto.
+        _ULTIMO_ERROR_SECRETS[nombre] = f"{type(e).__name__}: {e}"
+        return None
+    if valor is None:
+        _ULTIMO_ERROR_SECRETS[nombre] = "no está esa clave en st.secrets (ni en variables de entorno)"
+        return None
+    if hasattr(valor, "get") and not isinstance(valor, str):
+        anidado = valor.get(nombre)  # ver nota sobre [NOMBRE] mal formateado arriba
+        if anidado and str(anidado).strip():
+            return str(anidado).strip()
+        _ULTIMO_ERROR_SECRETS[nombre] = (
+            f"st.secrets['{nombre}'] es una sección/tabla, pero no tiene adentro "
+            f"una clave llamada igual ('{nombre}'). Contenido encontrado: {dict(valor) if hasattr(valor, 'items') else valor!r}")
+        return None
+    if str(valor).strip():
+        return str(valor).strip()
+    return None
+
+
+def diagnosticar_credencial(nombre: str) -> str:
+    """
+    Explica POR QUÉ _leer_credencial(nombre) devolvió None la última vez
+    que se llamó. Útil cuando una credencial "debería estar" en
+    secrets.toml pero el script sigue sin encontrarla.
+    """
+    partes = []
+    partes.append(f"Variable de entorno {nombre}: "
+                   f"{'definida' if os.environ.get(nombre) else 'NO definida'}")
+    if st is None:
+        partes.append("El paquete streamlit no está disponible en este proceso "
+                       "(_leer_credencial nunca llega a revisar st.secrets).")
+    else:
+        try:
+            ruta_secrets = getattr(st.secrets, "_file_paths", None)
+            partes.append(f"Streamlit busca secrets.toml en: {ruta_secrets or '(no se pudo determinar)'}")
+        except Exception:
+            pass
+        if nombre in _ULTIMO_ERROR_SECRETS:
+            partes.append(f"Último motivo al leer st.secrets['{nombre}']: {_ULTIMO_ERROR_SECRETS[nombre]}")
+        else:
+            partes.append(f"st.secrets['{nombre}'] no ha fallado todavía en este proceso "
+                           "(o nunca se intentó leer — ejecuta primero _leer_credencial).")
+    return "\n".join(partes)
+
+
+class ConfiguracionTursoFaltante(RuntimeError):
+    """Se lanza cuando no se encontró TURSO_DATABASE_URL / TURSO_AUTH_TOKEN."""
+    pass
+
+
+def _normalizar_url_turso(url: str) -> str:
+    """
+    El cliente HTTP necesita "https://", no "libsql://" (ese esquema es
+    para el transporte WebSocket, que ya mostró fallos de handshake contra
+    algunas bases/regiones de Turso). Mismo host, mismo puerto — solo
+    cambia el esquema al inicio de la URL.
+    """
+    if url and url.startswith("libsql://"):
+        return "https://" + url[len("libsql://"):]
+    return url
+
+
+# ─── Cliente compartido (una sola conexión de red, reutilizada) ────────────
+_lock = threading.Lock()
+_client = None
+
+
+def _get_client():
+    global _client
+    with _lock:
+        if _client is not None and not _client.closed:
+            return _client
+        url = _leer_credencial("TURSO_DATABASE_URL")
+        token = _leer_credencial("TURSO_AUTH_TOKEN")
+        if not url:
+            raise ConfiguracionTursoFaltante(
+                "Falta configurar TURSO_DATABASE_URL (y TURSO_AUTH_TOKEN) como variable de "
+                "entorno o en st.secrets. Ve a https://turso.tech, crea una base de datos "
+                "gratuita, y agrega esas dos claves en Settings → Secrets de tu app en "
+                "Streamlit Community Cloud.")
+        url = _normalizar_url_turso(url)
+        _client = ClienteTursoHTTP(url=url, auth_token=token)
+        return _client
+
+
+def cerrar_cliente_global():
+    """Cierra y descarta el cliente compartido (útil en pruebas)."""
+    global _client
+    with _lock:
+        if _client is not None:
+            try:
+                _client.close()
+            except Exception:
+                pass
+        _client = None
+
+
+# ─── Traducción de errores: LibsqlError → sqlite3.IntegrityError / sqlite3.OperationalError ─
+def _traducir_error(exc: "LibsqlError"):
+    """
+    Convierte un error del servidor Turso al equivalente de sqlite3, para
+    que el código existente (`except sqlite3.IntegrityError: ...`) siga
+    funcionando sin cambios. El texto original del error (p. ej. el nombre
+    de la columna que violó la restricción UNIQUE) se conserva en el
+    mensaje, porque varios módulos hacen `if "username" in str(e)`.
+    """
+    texto = f"{getattr(exc, 'code', '')}: {getattr(exc, 'explanation', str(exc))}"
+    if "constraint" in texto.lower():
+        return sqlite3.IntegrityError(texto)
+    return sqlite3.OperationalError(texto)
+
+
+# ─── Fila compatible con sqlite3.Row (acceso por índice, por nombre, Y dict()) ─
+# Varios módulos hacen `conn.row_factory = sqlite3.Row` y luego
+# `fila["columna"]` o `dict(fila)`. dict(fila) solo funciona si el objeto
+# tiene un método keys() (así decide Python que es "como un mapping") —
+# por eso esta clase lo implementa explícitamente, igual que sqlite3.Row.
+class Row:
+    """Fila compatible con sqlite3.Row: fila[0], fila["columna"], dict(fila)
+    e iteración por valores (list(fila)) — todo igual que sqlite3.Row."""
+    __slots__ = ("_columnas", "_valores")
+
+    def __init__(self, columnas, valores):
+        self._columnas = tuple(columnas)
+        self._valores = tuple(valores)
+
+    def __getitem__(self, clave):
+        if isinstance(clave, str):
+            try:
+                return self._valores[self._columnas.index(clave)]
+            except ValueError:
+                raise IndexError(f"No existe la columna '{clave}'")
+        return self._valores[clave]
+
+    def __len__(self):
+        return len(self._valores)
+
+    def __iter__(self):
+        return iter(self._valores)
+
+    def keys(self):
+        """Necesario para que dict(fila) funcione, igual que con sqlite3.Row."""
+        return list(self._columnas)
+
+    def __repr__(self):
+        return repr(dict(zip(self._columnas, self._valores)))
+
+
+# ─── DDL idempotente: no repetir CREATE ... IF NOT EXISTS ya ejecutados ─────
+# Casi todos los módulos tienen una función init_*_db() que corre varias
+# sentencias "CREATE TABLE IF NOT EXISTS" y se llama desde las funciones que
+# dibujan cada sección — es decir, en CADA rerun de Streamlit. Con sqlite3
+# local eso costaba microsegundos; contra Turso cada sentencia es un viaje
+# de red completo (11 en db_utils, varias más en cada módulo). Como esas
+# sentencias son idempotentes por definición, una vez que una se ejecutó
+# con éxito en este proceso no hace falta volver a enviarla.
+# Limitación asumida: si alguien borra una tabla en Turso MIENTRAS la app
+# sigue corriendo, no se recreará hasta reiniciar el proceso.
+_PREFIJOS_DDL_IDEMPOTENTE = (
+    "CREATE TABLE IF NOT EXISTS",
+    "CREATE INDEX IF NOT EXISTS",
+    "CREATE UNIQUE INDEX IF NOT EXISTS",
+)
+_DDL_YA_EJECUTADO = set()
+
+
+def _clave_ddl(sql: str):
+    """Devuelve una clave normalizada si `sql` es DDL idempotente, o None."""
+    normalizado = " ".join(sql.split())
+    if normalizado.upper().startswith(_PREFIJOS_DDL_IDEMPOTENTE):
+        return normalizado
+    return None
+
+
+# Al arrancar la app (proceso nuevo, o tras dormirse en Streamlit Cloud) las
+# funciones init_*_db() envían ~30 sentencias CREATE ... IF NOT EXISTS que NO
+# HACEN NADA porque las tablas ya existen, pero cada una es un viaje de red
+# (~10 s de espera inicial con una base remota). Se consulta UNA sola vez qué
+# tablas/índices existen y se omiten los CREATE de los que ya están.
+_RE_NOMBRE_DDL = re.compile(
+    r'^CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)\s+IF\s+NOT\s+EXISTS\s+["`\[]?(?:\w+\.)?(\w+)', re.I)
+_objetos_existentes = None      # set de nombres en minúsculas; None = por consultar
+_objetos_lock = threading.Lock()
+
+
+def _objeto_ya_existe(sql_normalizado: str, cliente) -> bool:
+    """True si el CREATE ... IF NOT EXISTS apunta a algo que ya existe."""
+    global _objetos_existentes
+    m = _RE_NOMBRE_DDL.match(sql_normalizado)
+    if not m:
+        return False
+    with _objetos_lock:
+        if _objetos_existentes is None:
+            try:
+                res = cliente.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','index')", None)
+            except LibsqlError:
+                return False        # no se pudo saber: se ejecuta el CREATE normalmente
+            _objetos_existentes = {str(f[0]).lower() for f in res.rows}
+        return m.group(1).lower() in _objetos_existentes
+
+
+def _registrar_cambio_de_esquema(sql: str):
+    """Mantiene al día el conjunto de objetos existentes tras un DDL real."""
+    global _objetos_existentes
+    s = " ".join(sql.split())
+    m = _RE_NOMBRE_DDL.match(s)
+    with _objetos_lock:
+        if m and _objetos_existentes is not None:
+            _objetos_existentes.add(m.group(1).lower())      # CREATE nuevo: se añade
+        elif s.upper().startswith(("DROP", "ALTER", "CREATE")):
+            _objetos_existentes = None                        # cualquier otro cambio: se reconsulta
+            if s.upper().startswith("DROP"):
+                _DDL_YA_EJECUTADO.clear()   # tras un DROP, un CREATE IF NOT EXISTS vuelve a ser necesario
+
+
+def reiniciar_cache_ddl():
+    """Olvida qué DDL ya se ejecutó (útil en pruebas o tras recrear la base)."""
+    global _objetos_existentes
+    _DDL_YA_EJECUTADO.clear()
+    with _objetos_lock:
+        _objetos_existentes = None
+
+
+# ─── CACHÉ DE LECTURAS (SELECT) con invalidación por escritura ───────────────
+# Streamlit vuelve a ejecutar TODO el script en cada interacción, y con
+# st.tabs() las 13 secciones corren en cada rerun: decenas de SELECT que con
+# sqlite3 local eran gratis y contra Turso son un viaje de red cada uno. Los
+# resultados de SELECT se guardan en memoria unos segundos.
+#
+# Por qué es seguro:
+#  * Cualquier escritura (INSERT/UPDATE/DELETE/ALTER/DDL nuevo) invalida las
+#    lecturas afectadas ANTES de que la función que escribió continúe, así
+#    que dentro de esta app nunca se ve un dato viejo tras guardar algo.
+#    Cada lectura cacheada recuerda de qué tablas leyó; una escritura a la
+#    tabla X solo borra lo que leyó X (y cualquier lectura de la que no se
+#    pudo determinar la tabla). Escrituras a tablas "padre" o desconocidas
+#    vacían todo el caché (por si hubiera borrados en cascada).
+#  * Nunca se cachean las tablas "en vivo" (sesiones, sesiones_activas,
+#    sesiones_historial, mensajes_chat) ni consultas no deterministas
+#    (random(), 'now', last_insert_rowid()...).
+#  * Si una escritura ocurre mientras otra sesión estaba leyendo, el
+#    resultado de esa lectura se descarta en vez de guardarse (contador de
+#    "generación").
+# Límite asumido: el caché es POR PROCESO. Si otro proceso (p. ej. el script
+# de migración, o la app corriendo en local contra la misma base) escribe en
+# Turso, esta instancia lo verá cuando venza el TTL. TTL por defecto: 30 s;
+# se ajusta con la variable de entorno DB_CACHE_TTL_SEGUNDOS (0 = desactivar).
+def _leer_ttl_cache() -> float:
+    try:
+        return max(0.0, float(os.environ.get("DB_CACHE_TTL_SEGUNDOS", "30")))
+    except ValueError:
+        return 30.0
+
+
+_TTL_LECTURAS = _leer_ttl_cache()
+_MAX_BYTES_ENTRADA = 4_000_000     # un resultado más grande (p. ej. varias fotos) no se cachea
+_MAX_BYTES_TOTAL = 40_000_000
+_MAX_ENTRADAS = 400
+
+# Tablas que se escriben con mucha frecuencia (latido de sesión, auditoría,
+# chat): una escritura a ellas solo invalida las lecturas que las usaron.
+_TABLAS_ESCRITURA_SELECTIVAS = {
+    "sesiones", "sesiones_activas", "sesiones_historial", "mensajes_chat", "auditoria",
+}
+_RE_TABLAS_EN_VIVO = re.compile(
+    r"\b(sesiones|sesiones_activas|sesiones_historial|mensajes_chat)\b", re.I)
+_RE_NO_DETERMINISTA = re.compile(
+    r"\b(random|last_insert_rowid|changes|total_changes)\s*\(|'now'|\"now\"|current_(timestamp|date|time)",
+    re.I)
+# PRAGMA table_info(x) solo cambia con ALTER/CREATE/DROP sobre x, que ya invalidan
+# el caché. Módulos como backup_proyecto lo consultan ~80 veces por dibujado.
+_RE_PRAGMA_ESTRUCTURA = re.compile(
+    r'^PRAGMA\s+table_x?info\s*\(\s*["`\[]?(?:\w+\.)?(\w+)["`\]]?\s*\)\s*;?$', re.I)
+_RE_TABLAS_SELECT = re.compile(r'\b(?:FROM|JOIN)\s+["`\[]?(?:\w+\.)?(\w+)', re.I)
+_RE_FROM_CON_COMA = re.compile(r'\bFROM\s+[\w"`\.]+(?:\s+(?:AS\s+)?\w+)?\s*,', re.I)
+_RE_TABLA_ESCRITURA = re.compile(
+    r'^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM'
+    r'|ALTER\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?'
+    r'|CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)(?:\s+IF\s+NOT\s+EXISTS)?)'
+    r'\s+["`\[]?(?:\w+\.)?(\w+)', re.I)
+
+_cache_lecturas = OrderedDict()    # clave -> (expira, resultado, bytes, tablas|None)
+_cache_bytes = 0
+_cache_generacion = 0
+_cache_lock = threading.Lock()
+_cache_stats = {"hits": 0, "misses": 0, "invalidaciones": 0}
+
+
+def _es_lectura(sql: str) -> bool:
+    s = sql.lstrip().upper()
+    return s.startswith("SELECT") or (s.startswith("PRAGMA") and "=" not in s)
+
+
+def _clave_lectura(sql: str, args):
+    """(sql_normalizado, args) si este SELECT se puede cachear; si no, None."""
+    if _TTL_LECTURAS <= 0:
+        return None
+    normalizado = " ".join(sql.split())
+    if not (normalizado.upper().startswith("SELECT") or _RE_PRAGMA_ESTRUCTURA.match(normalizado)):
+        return None
+    es_pragma = bool(_RE_PRAGMA_ESTRUCTURA.match(normalizado))
+    # La exclusión de tablas "en vivo" aplica a los DATOS (SELECT), no a la
+    # estructura: PRAGMA table_info(sesiones) describe columnas, no sesiones.
+    if (not es_pragma and _RE_TABLAS_EN_VIVO.search(normalizado)) or _RE_NO_DETERMINISTA.search(normalizado):
+        return None
+    clave = (normalizado, tuple(args) if args else ())
+    try:
+        hash(clave)
+    except TypeError:
+        return None
+    return clave
+
+
+def _tablas_de_select(sql: str):
+    """Conjunto de tablas que lee el SELECT, o None si no se pudo determinar."""
+    m_pragma = _RE_PRAGMA_ESTRUCTURA.match(" ".join(sql.split()))
+    if m_pragma:
+        return frozenset({m_pragma.group(1).lower()})
+    if _RE_FROM_CON_COMA.search(sql):
+        return None
+    tablas = {m.lower() for m in _RE_TABLAS_SELECT.findall(sql)}
+    return frozenset(tablas) if tablas else None
+
+
+def _bytes_de_resultado(resultado) -> int:
+    total = 0
+    for fila in resultado.rows:
+        total += 64
+        for v in fila:
+            total += len(v) if isinstance(v, (bytes, str)) else 16
+    return total
+
+
+def _cache_leer(clave):
+    global _cache_bytes
+    with _cache_lock:
+        item = _cache_lecturas.get(clave)
+        if item is None:
+            _cache_stats["misses"] += 1
+            return None
+        expira, resultado, tam, _tablas = item
+        if expira < time.monotonic():
+            del _cache_lecturas[clave]
+            _cache_bytes -= tam
+            _cache_stats["misses"] += 1
+            return None
+        _cache_lecturas.move_to_end(clave)
+        _cache_stats["hits"] += 1
+        return resultado
+
+
+def _cache_guardar(clave, resultado, tablas, generacion_al_leer: int):
+    global _cache_bytes
+    tam = _bytes_de_resultado(resultado)
+    if tam > _MAX_BYTES_ENTRADA:
+        return
+    with _cache_lock:
+        if generacion_al_leer != _cache_generacion:
+            return  # hubo una escritura mientras se leía: el resultado puede ser viejo
+        previo = _cache_lecturas.pop(clave, None)
+        if previo is not None:
+            _cache_bytes -= previo[2]
+        _cache_lecturas[clave] = (time.monotonic() + _TTL_LECTURAS, resultado, tam, tablas)
+        _cache_bytes += tam
+        while _cache_lecturas and (len(_cache_lecturas) > _MAX_ENTRADAS
+                                   or _cache_bytes > _MAX_BYTES_TOTAL):
+            _, (_e, _r, t_viejo, _t) = _cache_lecturas.popitem(last=False)
+            _cache_bytes -= t_viejo
+
+
+def limpiar_cache_lecturas():
+    """Vacía todo el caché de lecturas (útil tras recrear la base o en pruebas)."""
+    global _cache_bytes, _cache_generacion
+    with _cache_lock:
+        _cache_lecturas.clear()
+        _cache_bytes = 0
+        _cache_generacion += 1
+        _cache_stats["invalidaciones"] += 1
+
+
+def _invalidar_por_escritura(sql: str):
+    """Invalida las lecturas afectadas por una sentencia que NO es lectura."""
+    global _cache_bytes, _cache_generacion
+    m = _RE_TABLA_ESCRITURA.match(sql)
+    tabla = m.group(1).lower() if m else None
+    if tabla is None or tabla not in _TABLAS_ESCRITURA_SELECTIVAS:
+        limpiar_cache_lecturas()
+        return
+    with _cache_lock:
+        _cache_generacion += 1
+        _cache_stats["invalidaciones"] += 1
+        for k in [k for k, (_e, _r, _t, tablas) in _cache_lecturas.items()
+                  if tablas is None or tabla in tablas]:
+            _cache_bytes -= _cache_lecturas.pop(k)[2]
+
+
+def estadisticas_cache_lecturas() -> dict:
+    """Aciertos/fallos/invalidaciones y tamaño actual (para diagnóstico)."""
+    with _cache_lock:
+        return dict(_cache_stats, entradas=len(_cache_lecturas),
+                    bytes=_cache_bytes, ttl_segundos=_TTL_LECTURAS)
+
+
+# ─── Adaptadores con API estilo sqlite3 ─────────────────────────────────────
+class _Cursor:
+    """Imita sqlite3.Cursor: execute(), executemany(), fetchone(), fetchall(),
+    fetchmany(), lastrowid, rowcount, description, close()."""
+
+    def __init__(self, conn: "Connection"):
+        self._conn = conn
+        self._rows = []
+        self._idx = 0
+        self.lastrowid = None
+        self.rowcount = -1
+        self.description = None
+
+    def _aplicar_resultado(self, resultado):
+        if self._conn.row_factory:
+            # sqlite3.Row (u otro row_factory "truthy") → se envuelve cada
+            # fila en db_conn.Row para igualar sqlite3.Row por completo,
+            # incluyendo dict(fila) (ver la clase Row más arriba).
+            self._rows = [Row(resultado.columns, r) for r in resultado.rows]
+        else:
+            self._rows = [tuple(r) for r in resultado.rows]
+        self._idx = 0
+        self.lastrowid = resultado.last_insert_rowid
+        self.rowcount = resultado.rows_affected
+        columnas = getattr(resultado, "columns", None) or []
+        self.description = tuple((c, None, None, None, None, None, None) for c in columnas) or None
+
+    def execute(self, sql, params=()):
+        args = list(params) if params else None
+
+        clave_ddl = None if args else _clave_ddl(sql)
+        if clave_ddl is not None and clave_ddl in _DDL_YA_EJECUTADO:
+            # Ya se ejecutó con éxito en este proceso: se omite el viaje de red.
+            self._rows, self._idx = [], 0
+            self.lastrowid, self.rowcount, self.description = None, 0, None
+            return self
+        if clave_ddl is not None and _objeto_ya_existe(clave_ddl, self._conn._client):
+            _DDL_YA_EJECUTADO.add(clave_ddl)   # ya existe en la base: no hay nada que crear
+            self._rows, self._idx = [], 0
+            self.lastrowid, self.rowcount, self.description = None, 0, None
+            return self
+
+        clave_sel = _clave_lectura(sql, args)
+        generacion = 0
+        if clave_sel is not None:
+            en_cache = _cache_leer(clave_sel)
+            if en_cache is not None:
+                self._aplicar_resultado(en_cache)
+                return self
+            generacion = _cache_generacion  # para descartar si hay una escritura en medio
+
+        es_escritura = not _es_lectura(sql)
+        try:
+            resultado = self._conn._client.execute(sql, args)
+        except LibsqlError as e:
+            raise _traducir_error(e) from e
+        finally:
+            if es_escritura:
+                # También si falló: el estado remoto es incierto, mejor no servir caché.
+                _invalidar_por_escritura(sql)
+        if clave_ddl is not None:
+            _DDL_YA_EJECUTADO.add(clave_ddl)
+        if es_escritura:
+            _registrar_cambio_de_esquema(sql)
+        if clave_sel is not None:
+            _cache_guardar(clave_sel, resultado, _tablas_de_select(sql), generacion)
+        self._aplicar_resultado(resultado)
+        return self
+
+    def executemany(self, sql, seq_de_params):
+        """Igual que sqlite3.Cursor.executemany(): ejecuta el mismo SQL una
+        vez por cada tupla de parámetros (en un solo viaje de red, vía
+        ClientSync.batch())."""
+        lote = [(sql, list(p)) for p in seq_de_params]
+        if not lote:
+            self._rows, self._idx = [], 0
+            self.rowcount = 0
+            return self
+        try:
+            resultados = self._conn._client.batch(lote)
+        except LibsqlError as e:
+            raise _traducir_error(e) from e
+        finally:
+            _invalidar_por_escritura(sql)
+        # sqlite3.Cursor.executemany() no deja filas para leer; se deja
+        # lastrowid/rowcount del ÚLTIMO statement ejecutado, igual que sqlite3.
+        self._rows, self._idx = [], 0
+        if resultados:
+            self.lastrowid = resultados[-1].last_insert_rowid
+            self.rowcount = sum(r.rows_affected for r in resultados)
+        return self
+
+    def fetchone(self):
+        if self._idx < len(self._rows):
+            fila = self._rows[self._idx]
+            self._idx += 1
+            return fila
+        return None
+
+    def fetchall(self):
+        restantes = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return restantes
+
+    def fetchmany(self, size=1):
+        restantes = self._rows[self._idx:self._idx + size]
+        self._idx += len(restantes)
+        return restantes
+
+    def close(self):
+        pass
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class Connection:
+    """Imita sqlite3.Connection: cursor(), execute(), executemany(), commit(),
+    rollback(), close(), row_factory."""
+
+    def __init__(self):
+        self._client = _get_client()
+        self.row_factory = None  # por defecto, igual que sqlite3: filas como tuplas
+
+    def cursor(self) -> _Cursor:
+        return _Cursor(self)
+
+    def execute(self, sql, params=()):
+        """Igual que sqlite3.Connection.execute(): atajo sin pasar por cursor()."""
+        return self.cursor().execute(sql, params)
+
+    def executemany(self, sql, seq_de_params):
+        """Igual que sqlite3.Connection.executemany(): atajo sin pasar por cursor()."""
+        return self.cursor().executemany(sql, seq_de_params)
+
+    def commit(self):
+        """No-op intencional: en libSQL (modo HTTP/'stateless') cada execute()
+        ya queda confirmado en el servidor. Se deja el método para no romper
+        el código existente que sigue llamando conn.commit()."""
+        pass
+
+    def rollback(self):
+        """No-op intencional, por la misma razón que commit(): no hay una
+        transacción abierta que revertir en el modo stateless de libSQL."""
+        pass
+
+    def close(self):
+        """No-op intencional: el cliente de red se reutiliza entre llamadas
+        (ver _get_client); cerrarlo en cada función sería muy costoso en
+        latencia. Usa cerrar_cliente_global() si alguna vez necesitas forzar
+        una reconexión completa (por ejemplo, en pruebas)."""
+        pass
+
+
+def connect(*args, **kwargs):
+    """Conexión local SQLite por defecto; Turso si se configura explícitamente."""
+    import os
+    if os.environ.get("TURSO_DATABASE_URL") and os.environ.get("TURSO_AUTH_TOKEN"):
+        return Connection()
+    from pathlib import Path
+    ruta = args[0] if args and isinstance(args[0], str) else os.environ.get(
+        "SOLARCALC_DB_PATH", str(Path(__file__).with_name("solar_calc.db")))
+    conn = sqlite3.connect(ruta, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ─── Equivalentes de utilidades de sqlite3 ──────────────────────────────────
+def Binary(datos: bytes) -> bytes:
+    """Equivalente a sqlite3.Binary(x): libSQL acepta bytes de Python
+    directamente como valor de una columna BLOB, así que esto es un alias."""
+    return bytes(datos)
+
+
+# Alias de las excepciones ya traducidas en _traducir_error(), para el
+# código que prefiera capturarlas como db_conn.IntegrityError /
+# db_conn.OperationalError en vez de sqlite3.IntegrityError / sqlite3.OperationalError
+# (ambas formas funcionan igual, son las mismas clases).
+IntegrityError = sqlite3.IntegrityError
+OperationalError = sqlite3.OperationalError
+Error = sqlite3.Error
